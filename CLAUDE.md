@@ -11,10 +11,10 @@ contains one generic aerial photo per property with a hand-marked legend
 is slow to search through in the field. This app puts the same information
 on a live, searchable, always-current map that crews pull up on their phone.
 
-**Status:** design complete, no code has been scaffolded yet. This file
-describes the intended architecture so implementation stays consistent.
-Update the "Common Commands" section below as soon as the project is
-scaffolded.
+**Status:** no code yet. An earlier scaffold was built to preview the idea
+and then intentionally deleted — the architecture below is still the plan.
+See `PROJECT_PLAN.md` for the ordered, two-person breakdown of how this
+actually gets built.
 
 ## Planned Architecture
 
@@ -51,8 +51,19 @@ Two distinct access levels — do not conflate them:
 - **Admin**: individual Supabase Auth accounts (email/password). Full CRUD
   on properties, regions, and pins.
 - **Crew**: a single shared PIN/passcode unlocks read-only access to all
-  properties. This is intentionally not per-user — no crew account
-  management overhead for v1.
+  properties. There is no crew Supabase account — no per-user management
+  overhead for v1.
+
+**Why crew reads must not go through the Supabase anon/publishable key:**
+that key ships in the browser bundle, so if the `properties`/`regions`/`pins`
+SELECT policies allowed it, anyone who extracted the key could bypass the
+PIN entirely. The earlier scaffold's approach (worth keeping): RLS grants
+read/write only to `authenticated` (logged-in admins); crew requests are
+verified server-side against a signed session cookie, then served through a
+server-only Supabase client using the secret/service-role key (bypasses
+RLS) on the crew's behalf. Keep a single server-side helper that decides
+"admin" vs "crew" vs neither, rather than checking auth state in multiple
+places.
 
 ## V1 Scope Boundaries
 
@@ -64,6 +75,6 @@ Explicitly deferred — do not build these unless asked:
 
 ## Common Commands
 
-Not yet applicable — no project has been scaffolded in this repo yet.
-Once the Next.js app is created, populate this section with the actual
+Not yet applicable — no project has been scaffolded in this repo yet. Once
+the Next.js app is (re)created, populate this section with the actual
 install/dev/build/lint/test commands.
