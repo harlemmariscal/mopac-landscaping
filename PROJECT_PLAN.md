@@ -1,25 +1,23 @@
 # Mopac Landscaping — Build Plan (Harlem & Micah)
 
-This splits the app into phases. Do them **in order** — each phase depends
-on the one before it. Within a phase, the two tracks can usually be built
-in parallel, but each track is a full vertical slice (UI → server logic →
-database), not a frontend/backend split. Swap who takes which track any
-time; the point is both of you touch the whole stack.
+Work through phases **in order** — each one depends on the last. Inside a
+phase, each of you owns a track end-to-end (UI → server logic → database),
+not a frontend/backend split. Swap tracks between phases if you want; the
+point is you both touch the whole stack.
 
-See `CLAUDE.md` for the architecture/data model/auth decisions referenced
-below.
+Every task below has: what it's for, the steps, and how you'll know it's
+done. See `CLAUDE.md` for the underlying architecture/data model/auth
+decisions these tasks implement.
 
 ---
 
 ## Phase 0 — Foundation (do together)
 
-Small and sequential enough that splitting it doesn't help.
-
 - [ ] Create the Supabase project, grab the API keys
 - [ ] Scaffold the Next.js app (TypeScript, Tailwind, App Router)
 - [ ] Write the SQL migration: `properties`, `regions`, `pins` tables, the
-      legend category enum, RLS policies (see Auth Model in `CLAUDE.md` —
-      admin-only reads via RLS, crew reads via a server-only client)
+      legend category enum, RLS policies (admin-only reads/writes via RLS;
+      crew reads happen through a server-only client — see `CLAUDE.md`)
 - [ ] Apply the migration to Supabase, confirm tables exist
 - [ ] Set up `.env.local.example` documenting every required env var
 - [ ] Get a blank page building and deploying to Vercel
@@ -31,55 +29,239 @@ Supabase database with the schema in place.
 
 ## Phase 1 — Access Control
 
-Nothing past this point is reachable without a working login/PIN gate, so
-it goes first.
+Nothing past this point is reachable without a working login/PIN gate.
 
-- **Track A — Admin login:** login page UI, Supabase Auth sign-in server
-  action, session-refresh middleware/proxy, sign-out.
-- **Track B — Crew PIN:** PIN entry page UI, PIN-check server action,
-  signed session cookie (HMAC'd with a server secret — don't just set a
-  plain "logged in" cookie), sign-out/exit.
+### Harlem — Track A: Admin Login
 
-**Merge point:** a shared `getAccessLevel()` server helper that returns
-`admin`, `crew`, or `null`, used by a protected layout that gates every
-`/properties` route.
+**1.A.1 — Supabase client helpers**
+Give the app a way to talk to Supabase from both the browser and the
+server.
+- Install `@supabase/supabase-js` and `@supabase/ssr`.
+- `src/lib/supabase/client.ts` — exports `createClient()` using
+  `createBrowserClient(url, publishableKey)`. This is what client
+  components use.
+- `src/lib/supabase/server.ts` — exports an **async** `createClient()`
+  using `createServerClient`, wired to Next's `cookies()` for reading and
+  writing the session cookie. This is what server components/actions use.
+- *Done when:* a server component can call `createClient()` and run
+  `supabase.auth.getUser()` without throwing.
 
-**Done when:** visiting the app with no session redirects to a choice of
-admin login or crew PIN, and each path correctly unlocks the app.
+**1.A.2 — Login page + sign-in action**
+Let an admin log in with email/password.
+- `/login` route: email + password inputs, submit button, inline error
+  display.
+- A server action `signIn(prevState, formData)` that calls
+  `supabase.auth.signInWithPassword({ email, password })`. On success,
+  `redirect('/properties')`. On failure, return `{ error: '...' }`.
+- Wire the form to the action with React's `useActionState` so the error
+  shows without a full page reload.
+- *Done when:* a real admin account logs in and lands on `/properties`;
+  wrong credentials show an inline error, no crash.
+
+**1.A.3 — Session refresh (`proxy.ts` / middleware)**
+Keep the admin's session alive across requests instead of it silently
+expiring mid-visit.
+- `src/proxy.ts` (Next.js 16+ names this `proxy.ts`; older Next uses
+  `middleware.ts` — check what your scaffold generated) exporting an async
+  `proxy(request)` function.
+- Build a `createServerClient` inside it wired to read/write the
+  *request's* cookies, call `supabase.auth.getUser()` to force a refresh,
+  and return a `NextResponse` carrying the refreshed cookies.
+- Set `export const config = { matcher: [...] }` to skip static assets.
+- *Done when:* staying on the app and navigating around for several
+  minutes doesn't randomly log you out.
+
+**1.A.4 — Sign out**
+- A server action calling `supabase.auth.signOut()`, then
+  `redirect('/login')`.
+- A button in a shared header/layout.
+- *Done when:* signing out and then visiting `/properties` bounces you to
+  `/login`.
+
+### Micah — Track B: Crew PIN Access
+
+**1.B.1 — Crew session helper (signed cookie)**
+A way to mark "this browser proved it knows the PIN" that can't be
+trivially forged by just setting a cookie by hand.
+- Add env vars `CREW_PIN` (the real passcode) and `CREW_SESSION_SECRET`
+  (a long random string, `openssl rand -hex 32`).
+- `src/lib/crew-access/session.ts`:
+  - `verifyCrewPin(pin)` — compares the submitted PIN against `CREW_PIN`
+    using `crypto.timingSafeEqual` (not `===` — avoids leaking info via
+    response-time differences).
+  - `createCrewSession()` — sets an `httpOnly` cookie whose value is an
+    HMAC-SHA256 (keyed by `CREW_SESSION_SECRET`) of a fixed string.
+  - `hasCrewSession()` — recomputes that HMAC and compares it
+    (timing-safe) to the cookie's value.
+  - `clearCrewSession()` — deletes the cookie.
+- *Done when:* manually editing the cookie to a wrong value fails
+  `hasCrewSession()`; going through `createCrewSession()` then calling
+  `hasCrewSession()` returns `true`.
+
+**1.B.2 — PIN entry page + action**
+- `/crew-access` route: a single password-type input, submit button.
+- A server action `submitCrewPin(prevState, formData)` — calls
+  `verifyCrewPin`; on success calls `createCrewSession()` then
+  `redirect('/properties')`; on failure returns `{ error: '...' }`.
+- Wire with `useActionState`, same pattern as the admin login form.
+- *Done when:* the right PIN unlocks `/properties`; the wrong PIN shows an
+  error and does not set the cookie.
+
+**1.B.3 — Exit crew session**
+- A server action calling `clearCrewSession()`, then
+  `redirect('/crew-access')`. A button in the shared header.
+- *Done when:* after exiting, `/properties` bounces back to the PIN page.
+
+### Merge Task (pair on this, or whoever's free first)
+
+**1.M.1 — Access gate**
+One source of truth for "who's allowed to see this," so admin and crew
+logic never has to be checked ad hoc in multiple places.
+- `src/lib/access.ts` — exports `getAccessLevel()`: checks
+  `supabase.auth.getUser()` first (return `{ level: 'admin', userId }` if
+  present), else checks `hasCrewSession()` (return `{ level: 'crew' }`),
+  else `null`.
+- `src/app/properties/layout.tsx` (server component) calls
+  `getAccessLevel()` and redirects to `/crew-access` if it's `null`. Admin
+  gets extra UI (e.g. "Add property" link) that crew doesn't.
+- *Done when:* visiting any `/properties/*` route while logged out
+  redirects; both an admin session and a crew PIN session land inside
+  successfully.
 
 ---
 
 ## Phase 2 — Property List & Map Display
 
-Depends on Phase 1 (routes need to be gated) and Phase 0 (schema needs
-data — insert 2-3 test properties directly in Supabase to build against).
+Depends on Phase 1 (routes must be gated). Insert 2-3 test rows directly
+into `properties` via the Supabase table editor before starting — you need
+something to look at.
 
-- **Track A — Property list:** searchable list page, server-side query
-  against `properties`, links into the detail page.
-- **Track B — Property map:** the map component (MapLibre GL JS + Mapbox
-  satellite tiles), rendering a property's `regions`/`pins` with legend
-  colors, tap-to-see-note interaction, the fixed legend key.
+### Harlem — Track A: Property List
 
-**Done when:** both of you can log in (or PIN in) and browse from the
-property list into a property's map, seeing the manually-inserted test
-data render correctly.
+**2.A.1 — Test data**
+- In Supabase's Table Editor, insert 2-3 rows into `properties` (name,
+  address, and real lat/lng — right-click a spot in Google Maps to copy
+  coordinates).
+- *Done when:* `select * from properties` in the SQL editor returns your
+  rows.
+
+**2.A.2 — Property list page**
+- `/properties/page.tsx` (server component): read a `q` search param from
+  the URL.
+- Query Supabase for `id, name, address`, ordered by name; if `q` is
+  present, filter with `.or('name.ilike.%q%,address.ilike.%q%')`.
+- Render each result as a link to `/properties/[id]`.
+- A simple `<form>` with a GET-method search input tied to the `q` query
+  param (no client-side JS needed for this).
+- *Done when:* typing part of a name or address filters the list; clicking
+  a result navigates to its detail route (fine if that 404s until Micah's
+  task 2.B.3 lands).
+
+**2.A.3 — Empty/error states**
+- Handle zero results with a clear "No properties found" message.
+- Handle a Supabase query error by showing a message instead of crashing
+  the page.
+- *Done when:* searching a nonsense string shows the empty-state message,
+  not a blank page.
+
+### Micah — Track B: Property Map
+
+**2.B.1 — Legend constants**
+One shared definition of the 4 fixed categories so the map and any UI
+never drift apart.
+- `src/lib/legend.ts` — an array of
+  `{ value, label, color }` for `do_not_touch` (red), `mow_here` (yellow),
+  `kill_weeds` (orange), `cleanup` (green), plus `legendColor()` /
+  `legendLabel()` lookup helpers.
+- *Done when:* every place that needs a category's color/label imports
+  from this file — no color hex codes hardcoded elsewhere.
+
+**2.B.2 — Map component**
+Render a property's live satellite map with its regions/pins.
+- Install `maplibre-gl`.
+- A client component that creates a `maplibregl.Map` centered on the
+  property's `lat`/`lng`, using a Mapbox satellite style URL (needs
+  `NEXT_PUBLIC_MAPBOX_TOKEN`).
+- On the map's `load` event: add a GeoJSON source + fill/outline layers
+  for `regions` (colored via the category's `legendColor()`), and a
+  source + circle layer for `pins` (same coloring).
+- Click handlers on both layers open a popup showing the category label
+  and note.
+- *Done when:* a property with one manually-inserted region (any small
+  polygon GeoJSON) and one pin renders both, correctly colored, and
+  clicking either shows a popup with its info.
+
+**2.B.3 — Property detail page**
+- `/properties/[id]/page.tsx` (server component): fetch the property, its
+  `regions`, and its `pins` in parallel (`Promise.all`).
+- Render the name, address, a legend key, and the map component with that
+  data. Handle a not-found id (`notFound()`).
+- *Done when:* navigating from the list to a specific property shows its
+  name, address, legend, and a live map with any test data on it.
 
 ---
 
 ## Phase 3 — Admin Content Tools
 
-The heaviest phase. Depends on Phase 2 (map component must exist before
-you can build an editor for it).
+The heaviest phase. Depends on Phase 2 — the map component has to exist
+before you can build tools that write to it.
 
-- **Track A — Add Property flow:** form UI, address → coordinates via the
-  Mapbox Geocoding API, insert into `properties`.
-- **Track B — Region/pin editor:** draw a region (polygon) or drop a pin
-  directly on the map, assign it a legend category + note, save/edit/
-  delete. This is the part that replaces "someone drawing on the binder
-  photo" — take the time to get the interaction right.
+### Harlem — Track A: Add Property Flow
 
-**Done when:** an admin can add a brand-new property and mark it up
-entirely through the browser, with zero manual database edits.
+**3.A.1 — Geocoding helper**
+Turn a typed address into map coordinates automatically — no manual
+pin-dropping to locate a new property.
+- A server-side function that calls the Mapbox Geocoding API
+  (`/geocoding/v5/mapbox.places/{address}.json?access_token=...`), parses
+  the first result's `center` as `[lng, lat]`, and throws a clear error if
+  nothing comes back.
+- *Done when:* calling it with a real street address returns sane
+  coordinates; a garbage string returns a handled error, not a crash.
+
+**3.A.2 — Add Property page + action**
+- `/properties/new/page.tsx` — admin-only (redirect non-admins via
+  `getAccessLevel()`); form for name + address.
+- A server action that re-checks admin access (don't trust the page
+  redirect alone), calls the geocoder, inserts into `properties`, and
+  redirects to the new property's detail page.
+- *Done when:* submitting a real address creates the property and lands
+  you on its (still-empty) map.
+
+**3.A.3 — Edit/archive property**
+- An edit form on the property detail page (admin-only) to update
+  name/address (re-geocode if the address changes).
+- A way to archive or delete a property that's no longer serviced —
+  your call on soft-delete vs. hard delete.
+- *Done when:* an admin can rename a property and see the change on next
+  load.
+
+### Micah — Track B: Region/Pin Editor
+
+This is the actual replacement for "drawing on the binder photo" — take
+the time to get the interaction right.
+
+**3.B.1 — Pin placement**
+- Add an "add pin" mode toggle to the map component (admin-only).
+- While in that mode, a map click captures `lat`/`lng`; show a small
+  form/popup to pick a legend category + optional note.
+- On submit, a server action inserts into `pins`; refresh the map's pin
+  layer with the new data (no full page reload needed).
+- *Done when:* an admin can click the map, pick "Kill Weeds," add a note,
+  and see the new pin appear immediately.
+
+**3.B.2 — Region drawing**
+- Add a "draw region" mode: capture a sequence of clicked points as a
+  polygon (close the loop on double-click or a "finish" button).
+- Same category + note form as pins; a server action inserts into
+  `regions` as GeoJSON; refresh the region layer.
+- *Done when:* an admin can draw a rough boundary (e.g. around a flower
+  bed), mark it "Do Not Touch," and see it render as a shaded region.
+
+**3.B.3 — Edit & delete**
+- Clicking an existing region/pin in admin mode opens it for editing
+  (category/note) or deletion, backed by update/delete server actions.
+- *Done when:* an admin can change a pin's note and delete a stale region,
+  both reflected on the map without a full page reload.
 
 ---
 
@@ -88,25 +270,47 @@ entirely through the browser, with zero manual database edits.
 Depends on Phases 2-3 being functionally complete — this phase makes them
 good enough to hand to an actual crew.
 
-- **Track A — Mobile & installability:** PWA manifest + icons, "Add to
-  Home Screen" flow, a real pass on mobile layout/touch targets (this is
-  used on a phone in the field, not a laptop).
-- **Track B — Error/empty/loading states:** what a crew member sees on a
-  bad connection, an empty property, a failed geocode, etc. Also basic
-  form validation on the admin side.
+### Harlem — Track A: Mobile & Installability
 
-**Done when:** you'd hand a crew member a phone with this open and not be
-nervous about it.
+**4.A.1 — PWA manifest + icons**
+- `public/manifest.webmanifest` (name, short_name, `start_url`,
+  background/theme colors, real icon assets — not a generic placeholder).
+- Link the manifest and theme color via the root layout's metadata.
+- *Done when:* "Add to Home Screen" on a phone browser shows the real
+  name/icon and opens straight into `/properties`.
+
+**4.A.2 — Mobile layout pass**
+- Check every screen at a small viewport: search bar, list, map, legend,
+  forms. Big enough tap targets, no horizontal scroll, map takes up real
+  screen space.
+- *Done when:* you've personally tested the full flow on an actual phone
+  (bonus points for testing it outside, standing where a crew would).
+
+### Micah — Track B: Error/Empty/Loading States
+
+**4.B.1 — Loading states**
+- Add `loading.tsx` files (Next.js file convention) for the list and
+  detail routes — a simple skeleton or spinner beats a blank screen.
+- *Done when:* throttling your connection in dev tools shows a loading
+  state instead of nothing.
+
+**4.B.2 — Error states**
+- `error.tsx` boundaries where useful; explicit handling for a missing
+  property (a real "not found" message, not a crash); required-field
+  validation messages on the admin forms.
+- *Done when:* intentionally breaking each of the above (bad id, empty
+  form submit, wrong Mapbox token) shows a readable message — never a raw
+  stack trace.
 
 ---
 
 ## Phase 5 — Deploy & Handoff (do together)
 
 - [ ] Point the company's domain at the Vercel deployment
-- [ ] Create real admin accounts (not test ones)
-- [ ] Set the real crew PIN
+- [ ] Create real admin accounts (retire any test ones)
+- [ ] Set the real crew PIN (retire any test PIN)
 - [ ] Walk one real property end-to-end with an actual crew member,
-      collect feedback
+      collect feedback, file it as backlog items below
 
 ---
 
